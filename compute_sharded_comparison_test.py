@@ -24,6 +24,18 @@ os.environ['TOKENIZERS_PARALLELISM'] = "True"
 flatten = lambda l : [x for s in l for x in s]
 shuffle = lambda l : random.sample(l, k=len(l))
 
+# Resolve local device index
+def _resolve_local_device(device: int) -> int:
+    vis = os.getenv("CUDA_VISIBLE_DEVICES")
+    if vis:
+        mask = [int(x) for x in vis.split(",") if x != ""]
+        # Map global id -> local index
+        if device in mask:
+            return mask.index(device)
+    return device  # assume already local
+
+
+
 def load_dataset(dataset_path):
     
     # For loading a JSON-serialized list of examples.
@@ -80,10 +92,18 @@ def worker(model_name_or_path,
            main_queue,
            worker_queue):
     
+    #inside your worker
+    local_dev = _resolve_local_device(device)
+    torch.cuda.set_device(local_dev)  # set current device for this process
+
     # Load model.
     m = AutoModelForCausalLM.from_pretrained(model_name_or_path)
-    m.cuda(device)
-    main_queue.put((device, True))
+    # m.cuda(device)
+    m.cuda(f"cuda:{local_dev}")
+    m.eval()
+
+    # main_queue.put((device, True))
+    main_queue.put((local_dev, True))
     
     # Wait for inference requests.
     while True:
