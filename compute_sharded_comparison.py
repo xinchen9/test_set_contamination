@@ -32,6 +32,40 @@ def load_dataset(dataset_path):
         lines = f.readlines()
     return lines
 
+def compute_logprob_of_token_sequence(tokens, model, context_len=2048, stride=1024, device=0):
+  """
+  Approximates logp(tokens) by sliding a window over the tokens with a stride.
+  """
+  inputs  = tokens[:-1]
+  targets = tokens[1:]
+
+  logp = torch.zeros((1, 1), dtype=torch.float32).to(device)
+
+  # compute the smallest multiple k of s so that t <= ks + c.
+  t = len(inputs); c = context_len; s = stride
+  k = math.ceil(max(0, t - c) / s)
+  all_logps = []
+  for j in range(k + 1):
+    start    = s * j
+    end      = min(s * j + c, t)
+    rel_offs = max(0, c - s) if j > 0 else 0
+
+    w_inp = inputs[start:end]; w_inp = torch.tensor(w_inp).to(device)
+    w_trg = targets[start:end]; w_trg = torch.tensor(w_trg).to(device)
+
+    model.eval()
+    with torch.no_grad():
+      out = model(torch.unsqueeze(w_inp, 0))
+      logps = torch.nn.functional.log_softmax(out.logits[0], dim=-1)
+      logps = logps.gather(-1, w_trg.unsqueeze(-1)).squeeze(-1)
+      logp += logps[rel_offs:].sum()
+
+    del w_inp
+    del w_trg
+    torch.cuda.empty_cache()
+
+  return logp.item()
+
 def worker(model_name_or_path,
            context_len,
            stride,
@@ -61,6 +95,17 @@ def worker(model_name_or_path,
             if item is None:
                 break
 
+            tokens, shard_id, is_canonical = item
+
+            # Compute logprob of tokens.
+            logprob = compute_logprob_of_token_sequence(tokens,
+                                                        m,
+                                                        context_len,
+                                                        stride,
+                                                        device=device_str)
+
+            # Send result to main process.
+            main_queue.put((logprob, shard_id, is_canonical))
         
     except Exception as e:
         # Report error to parent and exit cleanly
@@ -82,7 +127,7 @@ def main(model_name_or_path,
          permutations_per_shard=250,
          random_seed=0,
          log_file_path=None,
-         max_examples=None):
+         max_examples=5000):
     
     mp.set_start_method("spawn", force=True)
 
@@ -140,8 +185,6 @@ def main(model_name_or_path,
     while num_ready < num_workers:
         print(num_ready)
         msg = main_queue.get()
-        # print(msg)
-        # print(num_ready)
         if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "error":
             # Worker failed early; print and continue (or abort)
             print("Worker error:", msg[1])
@@ -151,6 +194,51 @@ def main(model_name_or_path,
         if is_ready:
             print(f"GPU {gpu_id} loaded model.")
         num_ready += 1
+
+    # Compute per-shard sizes.
+    shard_counts = [(x + 1 if i < num_examples % num_shards else x)
+                    for i, x in enumerate([num_examples // num_shards] * num_shards)]
+    shard_counts = np.asarray(shard_counts)
+
+    # Starting index for each shard.
+    shard_example_indices = [0] + np.cumsum(shard_counts).tolist()
+
+    #Issue requests round-robin across workers
+    for i, (start, end) in enumerate(zip(shard_example_indices, shard_example_indices[1:])):
+        shard = tokenized_examples[start:end]
+
+        # Canonical order -> send to worker 0 (or also round robin if you’d like)
+        worker_queues[0].put((flatten(shard), i, True))
+
+        # Shuffled orders
+        for j in range(permutations_per_shard):
+            w = j % num_workers
+            worker_queues[w].put((flatten(shuffle(shard)), i, False))
+
+     # Wait on requests.
+    total_work = num_shards * (1 + permutations_per_shard)
+    pbar = tqdm(total=total_work)
+
+    canonical_logprobs = [None for _ in range(num_shards)]
+    shuffled_logprobs = [[] for _ in range(num_shards)]
+
+    completed = 0
+    while completed < total_work:
+        msg = main_queue.get()
+        if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "error":
+            print("Worker error:", msg[1])
+            completed += 1  # don't deadlock; consider abort instead
+            pbar.update(1)
+            continue
+
+        logprob, shard_id, is_canonical = msg
+        if is_canonical:
+            canonical_logprobs[shard_id] = logprob
+        else:
+            shuffled_logprobs[shard_id].append(logprob)
+
+        pbar.update(1)
+        completed += 1
 
 
     for wq in worker_queues:
