@@ -53,11 +53,14 @@ def worker(model_name_or_path,
         m = AutoModelForCausalLM.from_pretrained(model_name_or_path)
         m.to(device_str)
         m.eval()
+        # Signal readiness
+        main_queue.put((local_device_index, True))
 
         while True:
             item = worker_queue.get()
             if item is None:
                 break
+
         
     except Exception as e:
         # Report error to parent and exit cleanly
@@ -132,8 +135,23 @@ def main(model_name_or_path,
         p.start()
         processes.append(p)
 
-        #wait untio each GPU load a model
-        
+    #wait untio each GPU load a model
+    num_ready = 0
+    while num_ready < num_workers:
+        print(num_ready)
+        msg = main_queue.get()
+        # print(msg)
+        # print(num_ready)
+        if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "error":
+            # Worker failed early; print and continue (or abort)
+            print("Worker error:", msg[1])
+            num_ready += 1  # avoid deadlock
+            continue
+        gpu_id, is_ready = msg
+        if is_ready:
+            print(f"GPU {gpu_id} loaded model.")
+        num_ready += 1
+
 
     for wq in worker_queues:
         wq.put(None)
